@@ -475,10 +475,18 @@ def _apply_session_env(env: dict, base: str | None) -> dict:
 
 # Patterns blocked even in unrestricted/container modes (catastrophic ops only).
 _ALWAYS_BLOCKED_PATTERNS = [
-    # Destructive filesystem operations
-    (re.compile(r'\brm\s+(-[^\s]*\s+)*-r\s*f?\s+/', re.IGNORECASE), "rm -rf on root"),
-    (re.compile(r'\brm\s+(-[^\s]*\s+)*-f\s*r?\s+/', re.IGNORECASE), "rm -rf on root"),
-    (re.compile(r'\brm\s+(-[^\s]*\s+)*/\s*$', re.IGNORECASE), "rm on root"),
+    # Destructive filesystem operations. "On root" means the root directory
+    # itself, not any absolute path: the trailing / here is followed by a
+    # boundary (end, whitespace, or the /* glob), so `rm -rf /tmp/onit/...`
+    # — an in-jail cleanup, the normal case — passes while `rm -rf /` and
+    # `rm -rf /*` are refused. Unanchored, the slash matched the first
+    # character of every absolute target and no session could ever delete
+    # its own scratch files.
+    # The root token ("/" or "/*", optionally quoted, trailing slashes and //
+    # included) may sit anywhere in the argument list, so `rm -rf /tmp /` and
+    # `rm -rf /tmp /*` are caught too, not just a leading root argument.
+    (re.compile(r'\brm\s+(?:-\S+\s+)*(?:\S+\s+)*?(?:[\x22\x27]?/\*?[\x22\x27]?|//)(?:\s|;|\||&|\Z)', re.IGNORECASE), "rm -rf on root"),
+    (re.compile(r'\brm\s+(?:-\S+\s+)*(?:\S+\s+)*?[\x22\x27]?/(?:\.\./)*\.\.(?:/+)?(?:\s|;|\||&|\Z)', re.IGNORECASE), "rm -rf on root"),
     (re.compile(r'>\s*/dev/(sd|hd|nvme|vd|xvd)', re.IGNORECASE), "write to block device"),
     (re.compile(r'>\s*/dev/mem', re.IGNORECASE), "write to /dev/mem"),
     (re.compile(r'\bdd\b.*\bof\s*=\s*/dev/', re.IGNORECASE), "dd to device"),
@@ -523,10 +531,10 @@ _BLOCKED_PATTERNS = [
     # Sensitive system files that no answer makes safe to hand over
     (re.compile(r'/etc/shadow', re.IGNORECASE), "/etc/shadow"),
     (re.compile(r'/etc/sudoers', re.IGNORECASE), "/etc/sudoers"),
-    # Destructive filesystem operations
-    (re.compile(r'\brm\s+(-[^\s]*\s+)*-r\s*f?\s+/', re.IGNORECASE), "rm -rf on root"),
-    (re.compile(r'\brm\s+(-[^\s]*\s+)*-f\s*r?\s+/', re.IGNORECASE), "rm -rf on root"),
-    (re.compile(r'\brm\s+(-[^\s]*\s+)*/\s*$', re.IGNORECASE), "rm on root"),
+    # Destructive filesystem operations — anchored to the root directory
+    # itself, same as _ALWAYS_BLOCKED_PATTERNS above (see the comment there).
+    (re.compile(r'\brm\s+(?:-\S+\s+)*(?:\S+\s+)*?(?:[\x22\x27]?/\*?[\x22\x27]?|//)(?:\s|;|\||&|\Z)', re.IGNORECASE), "rm -rf on root"),
+    (re.compile(r'\brm\s+(?:-\S+\s+)*(?:\S+\s+)*?[\x22\x27]?/(?:\.\./)*\.\.(?:/+)?(?:\s|;|\||&|\Z)', re.IGNORECASE), "rm -rf on root"),
     (re.compile(r'>\s*/dev/(sd|hd|nvme|vd|xvd)', re.IGNORECASE), "write to block device"),
     (re.compile(r'>\s*/dev/mem', re.IGNORECASE), "write to /dev/mem"),
     (re.compile(r'\bdd\b.*\bof\s*=\s*/dev/', re.IGNORECASE), "dd to device"),
