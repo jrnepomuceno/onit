@@ -602,3 +602,161 @@ class TestKnownEndpoints:
                                  "preset": None}])
         setup_mod._print_known_endpoints({})
         assert capsys.readouterr().out == ""
+
+
+# ── Shared Ollama key and secret deletion ──────────────────────────────────
+
+class TestOllamaSharedKey:
+    """One Ollama key serves model access and web search: asked for once,
+    stored once, under ``ollama_api_key`` — never under the endpoint's URL."""
+
+    @pytest.fixture(autouse=True)
+    def _no_keychain(self, monkeypatch):
+        self.store = _fake_keystore(monkeypatch)
+        monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+        monkeypatch.delenv("ONIT_ENDPOINT_KEY_HTTPS_API_OLLAMA_COM",
+                           raising=False)
+        monkeypatch.delenv("ONIT_ENDPOINT_KEY_HTTPS_OLLAMA_COM",
+                           raising=False)
+
+    def _answer(self, monkeypatch, answer):
+        monkeypatch.setattr(setup_mod.getpass, "getpass",
+                            lambda prompt="": answer)
+
+    def test_the_key_is_stored_under_the_shared_name(self, monkeypatch):
+        self._answer(monkeypatch, "sk-ollama")
+        setup_mod._prompt_endpoint_key("https://api.ollama.com", None)
+        assert setup_mod.get_secret("ollama_api_key") == "sk-ollama"
+        assert setup_mod.get_endpoint_key("https://api.ollama.com") is None
+
+    def test_enter_keeps_and_dash_deletes(self, monkeypatch):
+        setup_mod.store_secret("ollama_api_key", "sk-ollama")
+        self._answer(monkeypatch, "")
+        setup_mod._prompt_endpoint_key("https://ollama.com", None)
+        assert setup_mod.get_secret("ollama_api_key") == "sk-ollama"
+        self._answer(monkeypatch, "-")
+        setup_mod._prompt_endpoint_key("https://ollama.com", None)
+        assert setup_mod.get_secret("ollama_api_key") is None
+
+    def test_an_older_endpoint_stored_key_is_promoted(self):
+        setup_mod.store_endpoint_key("https://ollama.com", "sk-old")
+        setup_mod.migrate_ollama_key()
+        assert setup_mod.get_secret("ollama_api_key") == "sk-old"
+        assert setup_mod.get_endpoint_key("https://ollama.com") is None
+
+    def test_migration_stops_when_the_shared_key_is_set(self):
+        setup_mod.store_secret("ollama_api_key", "sk-new")
+        setup_mod.store_endpoint_key("https://ollama.com", "sk-old")
+        setup_mod.migrate_ollama_key()
+        assert setup_mod.get_secret("ollama_api_key") == "sk-new"
+        assert setup_mod.get_endpoint_key("https://ollama.com") == "sk-old"
+
+    def test_a_local_ollama_endpoint_keeps_its_own_prompt(self, monkeypatch):
+        self._answer(monkeypatch, "sk-x")
+        setup_mod._prompt_endpoint_key("http://localhost:11434", None)
+        assert setup_mod.get_endpoint_key("http://localhost:11434") == "sk-x"
+        assert setup_mod.get_secret("ollama_api_key") is None
+
+    def test_the_model_reader_finds_the_shared_key(self):
+        """chat.py resolves an Ollama endpoint's key through the legacy map;
+        the shared name is what that map selects."""
+        setup_mod.store_secret("ollama_api_key", "sk-ollama")
+        assert setup_mod.endpoint_key_source("https://api.ollama.com") \
+            == "ollama_api_key"
+
+
+class TestIntegrationsSkip:
+    """The Integrations section shows, not asks, what the endpoint editor
+    already covered."""
+
+    @pytest.fixture(autouse=True)
+    def _no_keychain(self, monkeypatch):
+        self.store = _fake_keystore(monkeypatch)
+
+    def test_the_ollama_key_is_skipped_when_an_ollama_endpoint_uses_it(self):
+        cfg = {"serving": {"endpoints": [
+            {"host": "https://api.ollama.com", "model": "glm-5.3:cloud"}]}}
+        setup_mod.store_secret("ollama_api_key", "sk-ollama")
+        assert setup_mod._ollama_skip_set(cfg) == {"ollama_api_key"}
+
+    def test_an_unset_key_is_left_to_integrations(self):
+        cfg = {"serving": {"endpoints": [
+            {"host": "https://api.ollama.com"}]}}
+        assert setup_mod._ollama_skip_set(cfg) == set()
+
+    def test_no_ollama_endpoint_no_skip(self):
+        cfg = {"serving": {"endpoints": [
+            {"host": "http://localhost:8000/v1"}]}}
+        setup_mod.store_secret("ollama_api_key", "sk-ollama")
+        assert setup_mod._ollama_skip_set(cfg) == set()
+
+    def test_skipped_secrets_are_shown_not_prompted(self, monkeypatch, capsys):
+        setup_mod.store_secret("ollama_api_key", "sk-ollama")
+        cfg = {"serving": {"endpoints": [
+            {"host": "https://api.ollama.com"}]}}
+        prompts = []
+
+        def _record(prompt=""):
+            prompts.append(prompt)
+            return ""
+
+        monkeypatch.setattr(setup_mod.getpass, "getpass", _record)
+        secrets = [s for s in setup_mod.INTEGRATION_SECRETS
+                   if s[0] == "ollama_api_key"]
+        setup_mod._prompt_secrets(secrets, skip=setup_mod._ollama_skip_set(cfg))
+        assert prompts == []
+        out = capsys.readouterr().out
+        assert "shared with model access" in out
+
+    def test_unskipped_secrets_still_prompt(self, monkeypatch):
+        cfg = {"serving": {"endpoints": [
+            {"host": "http://localhost:8000/v1"}]}}
+        monkeypatch.setattr(setup_mod.getpass, "getpass",
+                            lambda prompt="": "tvly-new")
+        secrets = [s for s in setup_mod.INTEGRATION_SECRETS
+                   if s[0] == "tavily_api_key"]
+        setup_mod._prompt_secrets(secrets, skip=setup_mod._ollama_skip_set(cfg))
+        assert setup_mod.get_secret("tavily_api_key") == "tvly-new"
+
+
+class TestDeleteNamedSecret:
+    """``onit setup --delete`` removes a stored secret by alias, keyring
+    key, or endpoint URL — the mechanism the prompts alone did not expose."""
+
+    @pytest.fixture(autouse=True)
+    def _no_keychain(self, monkeypatch):
+        self.store = _fake_keystore(monkeypatch)
+
+    def test_an_alias_deletes_its_key(self):
+        setup_mod.store_secret("tavily_api_key", "tvly-1")
+        ok, message = setup_mod.delete_named_secret("tavily")
+        assert ok and "deleted tavily_api_key" in message
+        assert setup_mod.get_secret("tavily_api_key") is None
+
+    def test_the_full_keyring_key_is_accepted(self):
+        setup_mod.store_secret("github_token", "ghp-1")
+        ok, message = setup_mod.delete_named_secret("github_token")
+        assert ok and "deleted github_token" in message
+
+    def test_google_deletes_both_halves(self):
+        setup_mod.store_secret("web_google_client_id", "id-1")
+        setup_mod.store_secret("web_google_client_secret", "sec-1")
+        ok, message = setup_mod.delete_named_secret("google")
+        assert ok
+        assert setup_mod.get_secret("web_google_client_id") is None
+        assert setup_mod.get_secret("web_google_client_secret") is None
+
+    def test_an_unset_key_is_reported_not_forgotten(self):
+        ok, message = setup_mod.delete_named_secret("tavily")
+        assert ok and "was not set" in message
+
+    def test_an_unknown_name_is_refused(self):
+        ok, message = setup_mod.delete_named_secret("frobnicate")
+        assert not ok and "unknown secret" in message
+        assert "tavily" in message  # the known names are listed
+
+    def test_an_endpoint_url_deletes_its_key(self):
+        setup_mod.store_endpoint_key("http://a:8000/v1", "sk-a")
+        ok, message = setup_mod.delete_named_secret("http://a:8000/v1/")
+        assert ok and "http://a:8000/v1" in message
+        assert setup_mod.get_endpoint_key("http://a:8000/v1") is None

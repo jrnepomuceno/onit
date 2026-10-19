@@ -8,6 +8,7 @@ non-secret settings are written to ~/.onit/config.yaml.
 Usage:
     onit setup          # interactive wizard
     onit setup --show   # display current configuration
+    onit setup --delete tavily   # remove a stored key
 """
 
 import getpass
@@ -50,6 +51,8 @@ LEGACY_SERVING_SECRETS = [
     ("vllm_api_key",           "vLLM API key (legacy fallback)",
      "VLLM_API_KEY"),
 ]
+
+OLLAMA_SECRET_KEY = "ollama_api_key"
 
 INTEGRATION_SECRETS = [
     # Still prompted, and not only a serving credential: without it the web
@@ -328,6 +331,16 @@ def is_ollama_host(host: str) -> bool:
     """
     host = host or ""
     return "ollama.com" in host or "ollama.ai" in host or ":11434" in host
+
+
+def is_ollama_cloud_host(host: str) -> bool:
+    """True for Ollama's cloud endpoints, whose key web search also uses.
+
+    Local Ollama (:11434) takes no key, so it is excluded; ``is_ollama_host``
+    is the broader test the fallback rule needs.
+    """
+    host = host or ""
+    return "ollama.com" in host or "ollama.ai" in host
 
 
 def endpoint_secret_name(host: str) -> str:
@@ -724,7 +737,15 @@ def _prompt_endpoint_key(host: str, previous_host: str | None) -> None:
     The key never goes into config.yaml — that file is world-readable on a
     shared host, and is the one thing here that gets copied around and pasted
     into issues.
+
+    Ollama cloud is the exception: its key is shared with the web search API,
+    so it is asked for and stored under its own name (see
+    ``_prompt_ollama_key``) instead of per endpoint — one credential, one
+    place, read by both model access and search.
     """
+    if is_ollama_cloud_host(host):
+        _prompt_ollama_key()
+        return
     move_endpoint_key(previous_host or "", host)
     existing = get_endpoint_key(host)
     if existing:
@@ -737,6 +758,58 @@ def _prompt_endpoint_key(host: str, previous_host: str | None) -> None:
         delete_endpoint_key(host)
     elif value:
         store_endpoint_key(host, value)
+
+
+_OLLAMA_CLOUD_HOSTS = ("https://api.ollama.com", "https://ollama.com",
+                       "https://ollama.ai")
+
+
+def migrate_ollama_key() -> None:
+    """Move an Ollama key stored under an endpoint's URL to its shared home.
+
+    Installs from before the shared key stored it as ``endpoint_key:<url>``;
+    the web search reader never looks there, so model access worked while
+    search quietly stayed off. Promotion is one-way and idempotent.
+    """
+    if get_secret(OLLAMA_SECRET_KEY):
+        return
+    for host in _OLLAMA_CLOUD_HOSTS:
+        value = get_secret(endpoint_secret_name(host))
+        if value:
+            store_secret(OLLAMA_SECRET_KEY, value)
+            delete_endpoint_key(host)
+            return
+    for name in _file_secrets_names():
+        if not name.startswith(_ENDPOINT_SECRET_PREFIX) or "ollama" not in name:
+            continue
+        host = name[len(_ENDPOINT_SECRET_PREFIX):]
+        value = get_secret(endpoint_secret_name(host))
+        if value:
+            store_secret(OLLAMA_SECRET_KEY, value)
+            delete_endpoint_key(host)
+            return
+
+
+def _prompt_ollama_key() -> None:
+    """Ask once for the Ollama key shared by model access and web search.
+
+    The Integrations section does not ask again while an Ollama cloud
+    endpoint is configured and the key is set — two prompts for one
+    credential is how its two readers end up holding different values.
+    """
+    migrate_ollama_key()
+    existing = get_secret(OLLAMA_SECRET_KEY)
+    if existing:
+        hint = "••••" + existing[-4:] + " — Enter keep, '-' delete"
+    else:
+        hint = "not set"
+    value = getpass.getpass(
+        "    Ollama API key (shared by model access and web search) "
+        f"[{hint}]: ").strip()
+    if value == "-":
+        delete_secret(OLLAMA_SECRET_KEY)
+    elif value:
+        store_secret(OLLAMA_SECRET_KEY, value)
 
 
 def _resolve_host_input(text: str, default: str) -> str | None:
@@ -952,6 +1025,10 @@ def show_config():
 
     print("\n  Integrations")
     _print_secrets(INTEGRATION_SECRETS)
+    if any(is_ollama_cloud_host(e.get("host", "")) for e in
+           _endpoint_list(config) or _entries_from_host(config)):
+        print("  The Ollama key above is shared by web search and "
+              "Ollama cloud endpoints.")
 
     print()
     for note in _provider_notes(config):
@@ -981,12 +1058,24 @@ def _prompt_settings(config: dict, settings: list[tuple]) -> None:
             _set_nested(config, dotpath, default)
 
 
-def _prompt_secrets(secrets: list[tuple]) -> None:
-    """Prompt for each secret, storing or clearing it in the keychain."""
+def _prompt_secrets(secrets: list, skip: set = ()) -> None:
+    """Prompt for each secret, storing or clearing it in the keychain.
+
+    ``skip`` names secrets already handled earlier in the run — the Ollama
+    key when an Ollama cloud endpoint is configured, which the endpoint
+    editor asks for. Skipped secrets are shown with their status instead of
+    prompted, so one credential is asked for at most once per run and both
+    of its readers see the same value.
+    """
     for key, label, env_var in secrets:
         existing = get_secret(key)
+        if key in skip:
+            status = (f"••••{existing[-4:]} (shared with model access)"
+                      if existing else "not set")
+            print(f"  {label:.<52s} {status}")
+            continue
         if existing:
-            hint = "••••" + existing[-4:]
+            hint = "••••" + existing[-4:] + " — Enter keep, '-' delete"
         elif env_var and os.environ.get(env_var):
             hint = "set via env var"
         else:
@@ -997,6 +1086,68 @@ def _prompt_secrets(secrets: list[tuple]) -> None:
             delete_secret(key)
         elif value:
             store_secret(key, value)
+
+
+def _ollama_skip_set(config: dict) -> set:
+    """Secrets the endpoint editor already covered, for ``_prompt_secrets``.
+
+    The Ollama key qualifies when an Ollama cloud endpoint is configured and
+    the key is set — entered there just now or stored by an earlier run. An
+    unset key is left to the Integrations section, which is then the only
+    place it is asked for.
+    """
+    entries = _endpoint_list(config) or _entries_from_host(config)
+    if (any(is_ollama_cloud_host(e.get("host", "")) for e in entries)
+            and get_secret(OLLAMA_SECRET_KEY)):
+        return {OLLAMA_SECRET_KEY}
+    return set()
+
+
+# Short names for deleting a secret from the command line, alongside the
+# keyring keys themselves, which are accepted as written.
+_SECRET_ALIASES = {
+    "ollama": ("ollama_api_key",),
+    "tavily": ("tavily_api_key",),
+    "weather": ("openweathermap_api_key",),
+    "openweathermap": ("openweathermap_api_key",),
+    "github": ("github_token",),
+    "hf": ("huggingface_token",),
+    "huggingface": ("huggingface_token",),
+    "openrouter": ("host_key",),
+    "openai": ("openai_api_key",),
+    "vllm": ("vllm_api_key",),
+    "google": ("web_google_client_id", "web_google_client_secret"),
+}
+
+
+def delete_named_secret(name: str) -> tuple:
+    """Delete one stored secret: an alias, a keyring key, or an endpoint URL.
+
+    Returns (deleted, message). Unknown names are reported, never guessed at
+    — deleting the wrong credential is not recoverable from here.
+    """
+    key = name.strip()
+    keys = _SECRET_ALIASES.get(key.lower())
+    if keys is None:
+        if key in {k for k, _, _ in SECRETS}:
+            keys = (key,)
+        elif "://" in key or key.startswith(_ENDPOINT_SECRET_PREFIX):
+            host = key[len(_ENDPOINT_SECRET_PREFIX):] if key.startswith(
+                _ENDPOINT_SECRET_PREFIX) else key
+            delete_endpoint_key(normalize_host(host))
+            return True, f"deleted endpoint key for {normalize_host(host)}"
+        else:
+            known = ", ".join(sorted(set(_SECRET_ALIASES)
+                                     | {k for k, _, _ in SECRETS}))
+            return False, f"unknown secret {name!r} — known: {known}"
+    outcomes = []
+    for k in keys:
+        if get_secret(k) is None:
+            outcomes.append(f"{k} was not set")
+        else:
+            delete_secret(k)
+            outcomes.append(f"deleted {k}")
+    return True, "; ".join(outcomes)
 
 
 def run_setup(show_only: bool = False):
@@ -1040,7 +1191,7 @@ def run_setup(show_only: bool = False):
     # ── Integrations ─────────────────────────────────────────────
     print("\n  Integrations (optional — press Enter to skip)")
     print("  " + "─" * 50)
-    _prompt_secrets(INTEGRATION_SECRETS)
+    _prompt_secrets(INTEGRATION_SECRETS, skip=_ollama_skip_set(config))
 
     _save_config(config)
 

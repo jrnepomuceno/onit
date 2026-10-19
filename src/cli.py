@@ -6,6 +6,7 @@ Usage:
     onit --restart-session                        # interactive terminal chat, fresh session
     onit setup                                    # interactive setup wizard
     onit setup --show                             # show current configuration
+    onit setup --delete tavily                    # remove a stored key
     onit sessions                                 # list previous sessions
     onit doctor [--deep]                          # run the live self-check battery
     onit resume [TAG_OR_ID]                       # resume a previous session
@@ -180,6 +181,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # setup
     setup_parser = subparsers.add_parser("setup", help="Interactive setup wizard.")
+    setup_parser.add_argument("--delete", metavar="KEY", action="append",
+                              default=[],
+                              help="Delete a stored secret and exit "
+                                   "(repeatable), e.g. --delete tavily. "
+                                   "Names: ollama, tavily, weather, github, "
+                                   "hf, openrouter, openai, vllm, google, "
+                                   "or an endpoint URL.")
     setup_parser.add_argument("--show", action="store_true",
                               help="Display current configuration.")
 
@@ -713,6 +721,16 @@ def main():
 
     # Setup wizard
     if args.command == "setup":
+        if args.delete:
+            from .setup import delete_named_secret
+            failed = False
+            for name in args.delete:
+                ok, message = delete_named_secret(name)
+                print(f"  {message}")
+                failed = failed or not ok
+            if failed:
+                sys.exit(1)
+            return
         from .setup import run_setup
         run_setup(show_only=args.show)
         return
