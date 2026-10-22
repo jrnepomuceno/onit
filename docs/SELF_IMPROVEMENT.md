@@ -1,9 +1,13 @@
 # Self-Improving OnIt — Literature Review and Scaffold Proposal
 
-**Status**: Phase 0 and Phase 0.5 implemented (see §5). Phases 1–4 are proposal / RFC.
-**Date**: August 2026 · *Revised August 20, 2026 — Phase 0.5 closed out; §1, §3, §5 and §8
-re-verified line by line against `main` and against the 209 recorded trajectories. Previous
-revision August 09, 2026.*
+**Status**: Phase 0 and Phase 0.5 implemented (see §5). Phase 1 in progress. Phases 2–4 are
+proposal / RFC.
+**Date**: October 2026 · *Revised October 22, 2026 — full codebase review against `main`
+(commit `0f50822`) and against the live corpus. Every count in this document was
+re-measured; the previous revision's figures (209 records, 23 sessions, "~29 usable") are
+two months stale and are corrected in place. The data gate that had been holding Phase 1
+is now open — the blocker is the missing ruler, not the missing data. See §3.0.*
+*Previous revisions: August 20, 2026 (Phase 0.5 closed out) · August 09, 2026.*
 **Companions**: [`HARNESS_CAPABILITIES.md`](HARNESS_CAPABILITIES.md) — the harness track,
 now complete. [`SELF_IMPROVEMENT_GAPS.md`](SELF_IMPROVEMENT_GAPS.md) — the standing gap
 assessment against `main`; §3 and §8 here are kept consistent with it, and where the two
@@ -13,10 +17,20 @@ differ this document carries the reason why.
 
 ## 1. Executive summary
 
-OnIt today is a **static agent**: the prompt, the tool set, the loop policy and the model
-are fixed at process start, and the only thing that survives a session is a
-`{task, response, timestamp}` line in a JSONL file. Every run starts from the same place
-and learns nothing from the last thousand.
+**OnIt is a recording agent, not a learning agent.** The substrate is done and healthy:
+every task's full trajectory — every turn, every tool call, every failure, every token
+count — is written to disk and survives the session. What is missing is everything that
+would *close the loop*: retrieval, injection, reflection, promotion, and measurement.
+
+The precise statement of the gap, as of this revision:
+
+> 1,010 task records and 221 loop events are on disk across 58 session files
+> (Aug 4 – Oct 21, 2026). **Not one byte of it has ever been read back into a prompt.**
+> `src/learn/` writes a JSONL file that no model has ever seen.
+
+That is the whole problem, and it is a good problem: the expensive half of
+self-improvement (instrumenting a system honestly) is done, and the remaining half is
+additive work on top of a substrate that does not need redesigning.
 
 The SOTA literature converges on a clear split (see §2): **foundation-model improvement**
 (changing weights) versus **scaffold improvement** (changing prompts, memory, tools, and
@@ -45,6 +59,10 @@ and a held-out suite is the difference between self-improvement and self-delusio
 *Amended August 20: what it has is aimed at the model, not the scaffold. Every registered
 task is single-turn and near-saturated, and the two agentic tasks that would actually move
 under these loops are written but unregistered. See §3, gap 5.*
+*Amended October 22: GAIA and SimpleQA are now registered and run (SimpleQA scores 0.940,
+stderr 0.024). The remaining gap is not registration — it is that **there is no holdout at
+all**: no `eval/holdout.jsonl`, no `pinned.yaml`, and the pinned baseline holds two rows
+for one model. See §3.0 and §4.0.*
 
 The third thesis, added in the August 09 revision: **the harness must stop moving before
 the baseline is frozen.** See §1.1 — this reordered the plan, and the harness has now
@@ -53,10 +71,47 @@ stopped moving.
 The fourth thesis, added August 20: **the cheapest outcome signal in the system is one
 already being computed and thrown away.** [`verify.py`](../src/model/serving/verify.py)
 fact-checks every finished answer by default, and its verdict is already sitting in each
-trajectory's `metrics` blob — 151 of 209 records carry it. `derive_signals()` writes
-`"verifier": None` beside it. Meanwhile the human rating path has been wired for weeks and
-used **zero** times. Unlabeled experience is what blocks Loops A and B; the label is
-already on disk. See §3, gap 3.
+trajectory's `metrics` blob. `derive_signals()` now reads it. Meanwhile the human rating
+path has been wired for weeks and used **zero** times across 1,010 tasks. Unlabeled
+experience is what blocks Loops A and B; the label is already on disk. See §3, gap 3.
+*Amended October 22: the verifier now labels 820 clean / 70 issues / 120 unchecked out of
+1,010 — 88% weakly labeled. The label is no longer the blocker. The *rating* path is
+still at zero, and the implicit-signal replacement has not been built.*
+
+### 1.0 What the October 2026 review changed about the plan
+
+Five findings from the codebase review reshaped the schedule in §5. Each is a claim
+about the current tree, and each is verifiable.
+
+| # | Finding | Evidence | Effect on the plan |
+|---|---|---|---|
+| 1 | **The data gate is open.** 1,010 records / 58 files, 820 weakly labeled. | `~/.onit/learned/trajectories/` | The "wait for data" framing in earlier revisions is dead. Phase 1 is no longer blocked. |
+| 2 | **There is no ruler.** No `eval/`, no `holdout.jsonl`, no `pinned.yaml`; `benchmarks/baselines/full.json` has 2 rows. | `benchmarks/`, `~/.onit/learned/` | **This is now the blocker.** A rising score proves nothing if the system owns the ruler. |
+| 3 | **The injection path does not exist.** The `memories` kwarg was threaded then deleted; `_build_messages()` has no learned-context input. | `src/model/serving/chat.py` | Loop A must build the path, not re-enable a stub. |
+| 4 | **`src/learn/lifecycle.py` is dead code.** 178 lines of policy, zero production callers, one test importer. | `src/learn/lifecycle.py` | Either wire an actuator or delete it. Dead policy that reads as done is worse than either. |
+| 5 | **Owner isolation is inert.** All 1,010 records carry `owner: null`; `iter_records()` does not filter by owner. | `src/learn/trajectory.py` | Any recall built today would be **global** — a cross-tenant leak in a multi-user web deployment. |
+
+Finding 5 is the one that gates the others. A retrieval path that returns one user's
+sessions into another's prompt is not a feature, it is a breach, and it must be closed
+before the first episode is injected rather than after.
+
+The review also found three things that are *not* gaps but are worth recording as
+constraints the implementation must respect:
+
+- **Tool output is not marked untrusted in the message stream.** The standing rule
+  exists in the static half (`prompts.py`, gated on search tools), but tool results land
+  as bare `{'role': 'tool', 'content': result}`. For a self-improving agent this is worse
+  than for a static one: the agent will be *writing* what it learned from that output
+  into a durable artifact that later runs read.
+- **Learned artifacts are prompt-injection surfaces by construction.** A playbook bullet
+  distilled from a web page is a stored instruction. It needs the same untrusted-data
+  treatment, and the recall path must be **write-isolated** from the read path: the agent
+  must not be able to write into the store it reads from.
+- **`redact_tool_args` defaults to on**, so tool arguments are stored as digests. The
+  recurring bash fragments that Loop C would mine as skills are **not recoverable from the
+  current corpus**. That default has to be revisited before skill mining, or the mining
+  has nothing to mine.
+
 
 ### 1.1 Relationship to the harness track
 
@@ -78,8 +133,10 @@ the next slot?*
 **1. This track is currently blocked; that one is not.** §8 says do Phase 2 next, *"but not
 until there are enough trajectories to freeze a holdout from."* The holdout wants ≈100
 tasks drawn from real sessions. `onit learn` reported 10 across 1 session *at the time of
-writing; it reports 209 across 23 as of August 20, of which ~29 are usable — see §3 gap 6*. Phase 1
-and Phase 2 cannot honestly start for weeks of accrual. The harness work needs no data at
+writing; it reports 1,010 across 58 as of October 22, of which 820 carry a verifier
+label — see §3 gap 6*. *This scheduling argument expired in October 2026: the data
+arrived, and Phase 1 was unblocked. The blocker is now the missing ruler (§3.0), not the
+missing data.* The harness work needs no data at
 all. **The harness track is what happens while trajectories accumulate** — it is not a
 competitor for the slot, it is the thing that fills the slot that is empty anyway.
 
@@ -258,6 +315,55 @@ answer is no answer at all.
 
 ## 3. Where OnIt stands today
 
+### 3.0 Current-state audit — October 22, 2026
+
+Re-measured against `main` (`0f50822`) and the live corpus. This subsection is the
+authoritative count; the gap list that follows it in §3 is unchanged in substance but
+carries two-month-old figures, which are corrected in place and marked.
+
+**The corpus.**
+
+| Measure | Count | Note |
+|---|---|---|
+| Session files | **58** | `~/.onit/learned/trajectories/` |
+| Task records | **1,010** | Aug 4 → Oct 21, 2026 |
+| Loop events | **221** | `tool.registry_loaded` and friends |
+| Verifier labels | **820 clean / 70 issues / 120 unchecked** | 88% weakly labeled |
+| Human ratings | **0** | the 👍/👎 path has never been pressed |
+| Records with `owner` set | **0** | every record is `owner: null` |
+| Distinct models | **12** | Qwen3.8-27B 462 · glm-5.3-flash 333 · deepseek-v4-pro 142 · … |
+
+The corpus is **multi-model**. Any learned artifact is therefore *model-conditional*:
+retrieving an episode written by a different model retrieves a strategy that model may
+not be able to execute. The "pin per model, not globally" rule in §4.3 is load-bearing,
+not pedantry.
+
+**What the numbers change.** The previous revision said the corpus held "209 records, ~29
+usable" and that Phase 1 and Phase 2 "cannot honestly start for weeks of accrual." That
+is expired. The data is there; the label is there. The blocker is the ruler.
+
+**The five gaps that matter, in the order they bite.**
+
+| # | Gap | Where it lives | Why it blocks |
+|---|---|---|---|
+| 1 | **No ruler.** No `eval/`, no `holdout.jsonl`, no `pinned.yaml`; `benchmarks/baselines/full.json` pins 2 rows for 1 model. | `benchmarks/` | Without it, "it got better" is unfalsifiable, and the agent owns the measuring instrument. |
+| 2 | **No injection path.** `memories` was threaded `onit.py` → `chat()` → `_build_messages()` and never used; the Sept 22 simplification pass deleted the dead kwarg entirely. | `src/model/serving/chat.py` | `src/learn/` writes a file no model has ever seen. Everything else is a no-op until this exists. |
+| 3 | **No outcome signal beyond the fact-checker.** 0 ratings; no implicit signals; `onit learn` has no text-UI equivalent. | `src/learn/`, `src/ui/commands.py` | Loop B trains on 888 weakly-labeled records and no stronger evidence. |
+| 4 | **Dead policy module.** `should_propose_creation()` / `should_update()` / `should_archive()` / `pending_proposals()` have **zero production callers**; the only importer is `src/test/test_learn_events.py`, and the module is not exported from `learn/__init__.py`. | `src/learn/lifecycle.py` | Reads as "already done" to anyone skimming. Either wire an actuator or delete it. |
+| 5 | **No self-modification surface, and the autonomy ladder is decorative.** `_MAX_IMPLEMENTED = OBSERVE`; `adapt` / `extend` / `evolve` are exported, documented in `default.yaml`, and **silently degrade to `observe`**. | `src/learn/config.py` | A config asking for `adapt` gets a run that believes it is adapting and isn't. The cap is right; the silence is the bug. |
+
+Two of these are not gaps but **constraints the implementation must respect** — they are
+recorded in §1.0 and repeated where they bind: tool output carries no untrusted marking
+in the message stream, and `redact_tool_args` defaults to on, which makes the recurring
+bash fragments that Loop C would mine unrecoverable from the current corpus.
+
+**The one that gates everything else.** Owner isolation is inert: all 1,010 records carry
+`owner: null`, because `get_session_owner()` reads the session index, which is empty for
+CLI-recorded runs, and `iter_records()` does not filter by owner at all. `owner_hash()`
+exists; nothing enforces it. A recall path built today would return **global** results —
+in a multi-user web deployment, one tenant's sessions in another's prompt. I1/I7 in §4.0
+is not a nice-to-have; it is the precondition for the first episode ever being injected.
+
 An honest audit. Findings are file-referenced so they can be verified.
 
 **What already exists and is directly reusable:**
@@ -293,21 +399,22 @@ An honest audit. Findings are file-referenced so they can be verified.
 3. **No outcome signal.** *Closer to closed than this document has been claiming.* Three
    sources exist and the plan had counted one and a half:
    - **Free process signals** — tool errors, retries, truncations, compactions — derived
-     per run by `derive_signals()`. Present on all 209 records. These say a run went
+     per run by `derive_signals()`. Present on all 1,010 records. These say a run went
      *badly*, never that an answer was *wrong*.
    - **Human verdict** — `POST /api/rating` (👍/👎) appends a `rating` line, wired end to
-     end through the web UI. **Used zero times across 209 tasks.** A signal conditional on
+     end through the web UI. **Used zero times across 1,010 tasks.** A signal conditional on
      someone bothering to click is not a signal, and no amount of further UI work changes
      that. Implicit signals are the replacement, and are now a Phase 1 deliverable.
    - **A verifier that already runs.** [`verify.py`](../src/model/serving/verify.py)
      fact-checks each finished answer against the evidence that produced it, on by
      default, and `TurnMetrics` already records `verify_s`, `verify_issues` and
-     `verify_revisions` ([`chat.py`](../src/model/serving/chat.py#L273-L275)). Those flow
-     straight into each record's `metrics` blob today: **151 of 209 records carry them —
-     the check ran on 144 and revised 11.** `derive_signals()` nonetheless hardcodes
-     `"verifier": None` ([`trajectory.py`](../src/learn/trajectory.py#L159)). Promoting a
-     field that is already on disk is roughly ten lines, and is the cheapest outcome
-     signal anywhere in this plan.
+     `verify_revisions`. Those flow straight into each record's `metrics` blob.
+     **This one is now closed** — `verifier_signal()` reads the field, and the corpus
+     carries **820 clean / 70 issues / 120 unchecked** labels (§3.0). The gap that
+     remains is not the label but the *strength* of the signal: a weak binary label from
+     a model judge is enough to rank episodes, not enough to train a playbook on. That
+     is what implicit signals and the text-UI rating path (§5, deliverable 3) are for.
+     *Verified October 22, 2026 — this bullet was open in the August 20 revision.*
 4. **Tool set is frozen at startup.** `ToolRegistry.register()`
    ([`type/tools.py`](../src/type/tools.py#L595)) is called from exactly one site —
    [`lib/tools.py`](../src/lib/tools.py#L266), during discovery. No runtime registration,
@@ -324,14 +431,17 @@ An honest audit. Findings are file-referenced so they can be verified.
      multi-step tool use in it for a learned workflow to improve, and almost no headroom
      left if there were. Freezing a holdout from these would formalize the error rather
      than fix it — a ruler that cannot detect what Loops A–D change.
-   - The two benchmarks that *would* be sensitive are **written and unregistered**: GAIA
-     ([`tasks/agentic.py`](../benchmarks/tasks/agentic.py#L32)) and SimpleQA
-     ([`tasks/factuality.py`](../benchmarks/tasks/factuality.py#L24)) define `@task`
-     functions that appear in no `TASKS` entry and are unreachable from the runner.
-     Registering them is a two-line change and a precondition for §6 meaning anything.
-   - `RESULTS.md` still mixes five models across three hosts with no pinned row.
-6. **The recorded corpus is not comparable to itself.** `onit learn` reports 209 tasks
-   across 23 sessions, which reads as Gate 1 met. It is not. `stop_reason` is empty on
+   - The two benchmarks that *would* be sensitive are **registered and run** (September
+     04–06, 2026): GAIA ([`tasks/agentic.py`](../benchmarks/tasks/agentic.py)) and
+     SimpleQA ([`tasks/factuality.py`](../benchmarks/tasks/factuality.py)). Sampled-tier
+     rows: simpleqa 0.940 / stderr 0.024, humaneval 0.970 / 0.017, mbpp 0.990 / 0.010 —
+     all on `glm-5.3-flash:cloud`, 14 tools live, learn off. GAIA loads from the local
+     dataset cache with no token, but runs text-only (its wrapper ignores `file_path`),
+     so it is not yet holdout-ready.
+   - `RESULTS.md` still mixes models across hosts with no pinned row per model, and the
+     sampled-tier rows are reference points rather than pin-gated regression numbers.
+6. **The recorded corpus is not comparable to itself.** `onit learn` reports 1,010 tasks
+   across 58 sessions, which reads as Gate 1 met. It is not. `stop_reason` is empty on
    **179 of them**, because `RunState` only began recording it on August 18. H1 and H3
    (August 09) redefined what `tool_errors` counts — and `_build_parameters` had been
    dropping `required`, so `blank_required_args` never fired before then. H4's result store
@@ -340,8 +450,14 @@ An honest audit. Findings are file-referenced so they can be verified.
    happened, inside the store, before anything was pinned. The store needs an era or
    harness-version stamp per record so this is legible later instead of inferred from
    timestamps, as it had to be here.
-7. **The corpus mixes six models with no stratification.** deepseek-v4-pro (142),
-   Qwen3.8-27B (51), Qwen3.6-27B (6), plus three others. A lesson distilled from a frontier
+   *Updated October 22, 2026 — the corpus is 1,010 records, not 209; the 29-usable
+   figure describes the **pre-Phase-0.5 era** and does not describe the corpus as it
+   now stands. The comparability problem is real but is now bounded: the unusable
+   records are identifiable by timestamp, which is what the era stamp would make
+   explicit. The holdout must be drawn from the settled era only.*
+7. **The corpus mixes twelve models with no stratification.** Qwen3.8-27B (462),
+   glm-5.3-flash (333), deepseek-v4-pro (142), deepseek-v4.1-flash (46), plus eight
+   others. A lesson distilled from a frontier
    cloud model's trajectories may be actively wrong for an 8B local model — which is the
    deployment this plan exists to serve, and the case where the literature's gains are
    largest. §4.3's scope rules cover *owner* isolation and say nothing about model
@@ -367,22 +483,36 @@ forfeited prefix caching and read as a latency regression.
 
 ### 4.0 Layout and invariants
 
-One directory, one manifest:
+Two trees, one manifest each:
 
 ```
-~/.onit/learned/            # `learn.path`, or ONIT_LEARN_PATH
-  pinned.yaml               # THE source of truth for what is live. Rollback point.
-  trajectories/*.jsonl      # Layer 0 — raw experience              [implemented]
+~/.onit/learned/            # `learn.path`, or ONIT_LEARN_PATH — the AGENT'S tree
+  trajectories/*.jsonl      # Layer 0 — raw experience
   playbook/
     global.json             # Loop B — itemized bullets w/ counters + provenance
     user/<owner-hash>.json  #          per-owner scope (web multi-user)
   skills/<name>/            # Loop C — code + manifest.yaml + tests
   scaffold/
     archive/<gen>-<id>/     # Loop D — prompt/code variants + fitness records
+  index/
+    episodes.sqlite         # derived retrieval index (rebuildable, disposable)
+```
+
+```
+benchmarks/                 # the REPO'S tree — the ruler, outside the agent's reach
   eval/
     holdout.jsonl           # frozen; the improvement loops MUST NOT read this
+    dev.jsonl               # iteration split; loops may read this
     baseline.json           # pinned scores for A/B
+  baselines/
+    full.json               # the existing model-level pin (2 rows, 1 model)
 ```
+
+**The split is the point.** Everything in `~/.onit/learned/` is the agent's own
+writable surface — it is where trajectories land, where the playbook is promoted, where
+skills are installed. Everything in `benchmarks/eval/` is the measuring instrument, and
+it lives outside that surface by layout, not by convention (I7). A promotion gate that
+reads a holdout the agent can edit is not a gate.
 
 **Not in this tree, and deliberately so** — the harness track's per-session stores
 (`data_path/.onit/notes/`, `data_path/.onit/results/`) live under the **session's**
@@ -418,6 +548,31 @@ throughout. Resolved as a split:
   row; baselines run with learning off.
 - **I6 — Sandboxed generation.** Self-generated code is written, executed and tested only
   inside the container path, under the existing command policy.
+- **I7 — The ruler is outside the agent's writable surface.** *(Added October 22, 2026.)*
+  The holdout, the pinned baseline, the judge configuration and the promotion gate live
+  **outside** `data_path` and **outside** the learned store. No loop writes them, no
+  approval scope reaches them, and no `learn:` config key points at them. Without this,
+  I1 is a convention: a Loop C or D that can edit its own exam grades itself.
+
+**On I1 and I7 together.** I1 says no loop *reads* the holdout. I7 says no loop can
+*write* it. They are different failures and each is fatal alone: I1 without I7 is a
+convention against a cooperative agent, and I7 without I1 is a sealed box nobody opens.
+Together they are the difference between a self-improving system and a self-certifying
+one. Both must land **in the same commit** as the first promotion gate, because a
+promotion decided against a holdout the agent can edit is not a measurement.
+
+**On where the ruler physically lives.** Two candidate placements, and the tradeoff:
+
+| Placement | Pro | Con |
+|---|---|---|
+| `~/.onit/learned/eval/` | Next to the store it scores; one root to back up. | The agent's own writable tree. A skill with write access to `learn.path` could edit its own exam. |
+| **Repo-side, outside `learn.path`** *(chosen)* | Not under the agent's writable surface by construction. A deployment that gives the agent write access to `data_path` still cannot touch it. | Two roots to back up; a benchmark run needs both on disk. |
+
+The chosen placement is the repository's `benchmarks/` tree, with the holdout and the
+pinned baseline committed alongside the code they measure. A deployment that wants them
+elsewhere can point `eval.path` at a read-only mount — but the *default* must be
+somewhere the agent cannot reach, and "somewhere the agent cannot reach" has to be true
+by layout rather than by policy.
 
 ### 4.1 Layer 0 — the experience substrate *(prerequisite, ~1 week)*
 
@@ -460,19 +615,19 @@ Implementation notes:
 
 **Also in Layer 0 — outcome signals**, cheapest first:
 
-| Signal | Source | Cost | Status (Aug 20) |
+| Signal | Source | Cost | Status (Oct 22) |
 |---|---|---|---|
-| Tool error / retry / truncation counts | already in the loop | free | ✅ recorded, all 209 |
-| Efficiency (turns, tool calls, compactions, peak tokens) | `TurnMetrics` | free | ✅ recorded, all 209 |
-| **Verifier verdict** | [`verify.py`](../src/model/serving/verify.py) — on by default; `verify_issues`, `verify_revisions` | **free, already computed** | ⚠️ **in `metrics` on 151 records; `signals.verifier` still `None`** |
+| Tool error / retry / truncation counts | already in the loop | free | ✅ recorded, all 1,010 |
+| Efficiency (turns, tool calls, compactions, peak tokens) | `TurnMetrics` | free | ✅ recorded, all 1,010 |
+| **Verifier verdict** | [`verify.py`](../src/model/serving/verify.py) — on by default; `verify_issues`, `verify_revisions` | **free, already computed** | ✅ **read into `signals.verifier`; 820 clean / 70 issues / 120 unchecked** |
 | Execution feedback (exit codes, test pass/fail) | sandbox `bash` results | free, strongest where available | not extracted |
-| Implicit user signal | next-turn rephrase ≈ failure; acceptance/thanks ≈ success | small heuristic | not built — now Phase 1 (§8, item 3) |
-| Explicit rating | 👍/👎 endpoint in [`src/ui/api.py`](../src/ui/api.py) | ~half a day, highest value per bit | ✅ shipped · **used 0 times in 209 tasks** |
+| Implicit user signal | next-turn rephrase ≈ failure; acceptance/thanks ≈ success | small heuristic | not built — Phase 1 deliverable 3 (§5) |
+| Explicit rating | 👍/👎 endpoint in [`src/ui/api.py`](../src/ui/api.py) | ~half a day, highest value per bit | ✅ shipped · **used 0 times in 1,010 tasks** · no text-UI equivalent |
 | LLM judge | `onit_judge` on a sample | tokens | not wired to trajectories |
 
 The August 20 re-verification reordered this table. "Highest value per bit" was true of the
 explicit rating and irrelevant, because the bits never arrive: a signal gated on a human
-choosing to click produced nothing across 209 tasks. The verifier row is the correction —
+choosing to click produced nothing across 1,010 tasks. The verifier row is the correction —
 it is free, it is *already running*, and its verdict is already in the store. Reading it is
 item 1 of §8.
 
@@ -481,18 +636,35 @@ item 1 of §8.
 Retrieve the *k* most similar prior trajectories for the current task and inject their
 distilled outcome ("what worked / what failed"), Reflexion- and Dynamic-Cheatsheet-style.
 
-- **Wire the dead hook**: implement `memories` in
-  [`_build_messages()`](../src/model/serving/chat.py#L959) and populate it at
-  [`onit.py:1085`](../src/onit.py#L1085).
+- **Build the path** — there is no hook to wire. The `memories` kwarg was threaded
+  `onit.py` → `chat()` → `_build_messages()` and never referenced; the September 22
+  simplification pass **deleted the dead kwarg entirely**. `_build_messages()` today
+  takes no learned-context input. Loop A builds the path rather than re-enabling a
+  stub, and the value rides in the `RunState` (H6) rather than as a fourth ad-hoc
+  parameter.
 - **Placement**: a compact block in the **volatile half**, alongside the task — episodes
-  are per-task and would thrash the cache if placed in the prefix.
+  are per-task and would thrash the cache if placed in the prefix. The seam is
+  `split_instruction()` ([`lib/text.py`](../src/lib/text.py)); the prefix contract is
+  documented at [`chat.py`](../src/model/serving/chat.py) and is worth ~2,800
+  tokens/request on every turn of every task.
 - **Retrieval**: start with BM25/TF-IDF over the task text. OnIt already ships local
   search infrastructure ([`local/search/toolkit.py`](../src/mcp/servers/tasks/local/search/toolkit.py));
   reuse it before reaching for embeddings. Per user's constraint, no new pip deps —
-  hand-roll or reuse what's vendored.
+  hand-roll or reuse what's vendored. `toolkit.py` already has BM25, an optional dense
+  path and RRF; the corpus is small enough that BM25 alone is the right first cut.
 - **Budget**: hard cap (e.g. 800 tokens, k ≤ 3). Memory that crowds out the task is a
   regression.
 - **Kill switch**: `ONIT_LEARN=0` / `learn: false` in `default.yaml` bypasses everything.
+- **Owner scoping is not optional** *(added October 22, 2026)*. `iter_records()` does
+  not filter by owner today, and every one of the 1,010 records is `owner: null`
+  (§3.0). Recall must filter by owner *and* by model before it returns anything:
+  the corpus is multi-model (§3, gap 7), and an episode written by a different model
+  is a strategy that model may not be able to execute.
+- **Untrusted marking** *(added October 22, 2026)*. A recalled episode is distilled
+  from a run that read tool output, which may itself contain a prompt injection. The
+  injected block must be marked the way the standing rule marks tool output, and the
+  recall path must be **write-isolated** from the read path: the agent must not be able
+  to write into the store it recalls from.
 
 ### 4.3 Loop B — the playbook *(the main event, ~3 weeks)*
 
@@ -628,11 +800,85 @@ One knob, `learn.autonomy` in `default.yaml`, defaulting to 1:
 | **3 — extend** | Loop C live; skills auto-promote on a green gate, operator notified |
 | **4 — evolve** | Loop D; **always** human-reviewed PR, never auto-merge |
 
+**What happens when a level is asked for and does not exist.** Today
+`_MAX_IMPLEMENTED = OBSERVE` in [`src/learn/config.py`](../src/learn/config.py), and
+`autonomy()` returns `min(level, _MAX_IMPLEMENTED)`. A config asking for `adapt` gets
+`observe` — which is the *safe* behavior, and is the right default. The problem is that
+it is **silent**: the run believes it is adapting and is not, and nothing tells the
+operator. `learn report` and `onit learn --show` do not say "you asked for adapt, you
+got observe."
+
+*October 22, 2026 — this is a known defect, not a design choice.* The fix is one of two
+things, and the second is better:
+
+1. **Fail loudly.** A level above what is implemented is a configuration error and
+   should be one — a warning on startup and in `learn report`.
+2. **Rename the levels to what exists** *(preferred)*. Until Loops A–D land, the ladder
+   should read `off` / `observe` only, and the names `adapt` / `extend` / `evolve` should
+   be introduced **when the level they name actually works**. A config file that names
+   a rung that does not exist is a promise the code cannot keep, and every future
+   reader has to check which rungs are real.
+
+Either way the cap stays: the agent must not be able to talk itself into a level it has
+not earned.
+
 ---
 
 ## 5. Implementation plan
 
 Phases are sequential; each ends in something shippable and measurable.
+
+### 5.0 Build order *(added October 22, 2026)*
+
+The phases below are the *shape* of the work. This is the *order* to do it in, with the
+reason each item earns its place. The order changed in October 2026 because the blocker
+changed: the data arrived, so the ruler became the first thing to build rather than the
+last.
+
+| # | Deliverable | Size | Why here |
+|---|---|---|---|
+| 1 | **Holdout + baseline + the I1/I7 ownership invariant** | days | Without it, nothing after it is measurable. It also converts "the agent feels better" into a number the agent does not own. |
+| 2 | **Recall (Loop A)** | ~3 days | Smallest change that closes the loop end-to-end. Reuses `toolkit.py` BM25. A/B on the holdout; **ship only if it wins** — the null result is the common one. |
+| 3 | **Implicit signals + text-UI rating** | ~2 days | Turns 888 weakly-labeled records into a training set. Retroactive on existing data. |
+| 4 | **Playbook (Loop B)** | ~3 weeks | The main event. Reflector + Curator, delta-only updates, token-capped, version-pinned per session. |
+| 5 | **Lifecycle actuator, or delete `lifecycle.py`** | days | Either make the dead policy live or stop it reading as done. |
+| 6 | **Skills (Loop C), then evolve (Loop D)** | 4–6 weeks | Only after A and B show reproducible wins. Never core rewrites — coded extensions only. |
+
+**Why the ruler is first, and not last.** Three arguments converge on it.
+
+1. **The measurement must precede the change.** A recall path built before a holdout
+   exists can only be evaluated by feel, and feel is exactly the thing this track exists
+   to eliminate. PAST-Bench's finding is that the null result is the common one for
+   memory scaffolds — so a change shipped without a ruler is most likely to be shipped
+   on the strength of a coincidence.
+2. **The ruler must not be the agent's.** I7 (§4.0) is easiest to honor when the
+   holdout is created *before* the loops exist, because there is no loop yet that could
+   have influenced it. A holdout assembled after Loop A ships inherits whatever the
+   loop already changed.
+3. **It is the smallest deliverable with the largest downstream dependency.** Everything
+   else in this list ends in a promotion decision, and a promotion decision needs a
+   holdout. It is days of work, and it unblocks the other three weeks.
+
+**What "ship only if it wins" means concretely.** Deliverable 2 does not ship because
+it works; it ships because it wins on the holdout by more than the benchmark's stderr,
+with no regression on the previous generation's passing tasks (§6, rule 2 and 3). A null
+result is a *result*: it goes in `RESULTS.md` and the loop is not shipped. "The recall
+path made the answers feel more informed" is not a result.
+
+**The dependency that is easy to miss.** Deliverable 2 cannot be safely built before
+owner isolation is real. Today all 1,010 records carry `owner: null` and `iter_records()`
+does not filter by owner (§3.0, finding 5). A recall path built against that returns
+**global** results — in the multi-user web deployment OnIt already supports, one tenant's
+sessions land in another's prompt. Owner scoping is therefore part of deliverable 1, not
+a follow-up: it is a precondition for the first episode ever being injected.
+
+**What is explicitly not in this order.** No deliverable here changes the serving
+stack's prefix-cache contract (§4.3), the security/containment layer, or the model
+weights. The playbook rides at the *tail* of the static half so it survives the cache;
+the recall rides in the volatile half because episodes are per-task and would thrash the
+prefix. That placement is the single most load-bearing implementation detail in Loop A
+and it is specified in §4.2.
+
 
 ### Phase 0 — Instrument · autonomy 1 — **implemented**
 
@@ -667,14 +913,12 @@ Deferred, on **two** gates. As of August 20 the second is met and the first is n
 
 - **Freeze `eval/holdout.jsonl` and pin `eval/baseline.json`.** Still not done, and now
   squarely on the critical path (§8).
-  - **Gate 1 — data. Not met.** `onit learn` reports 209 tasks across 23 sessions, which
-    looks like twice the ≈100 the holdout wants. But only ~29 were recorded under the
-    settled harness, and the pre-August-18 majority carries no `stop_reason` at all (§3,
-    gap 6). Drawing a holdout from the full corpus would pin a baseline across three
-    different harnesses. Two ways out: wait for ~100 post-Phase-0.5 tasks, or draw the
-    holdout from the *tasks* in the existing corpus and re-run them under the current
-    harness to score them. The second is faster, uses the data already collected, and is
-    what §8 recommends.
+  - **Gate 1 — data. Met, as of October 22, 2026.** `onit learn` now reports **1,010
+    tasks across 58 sessions** (was 209 across 23), and **820 carry a verifier label**.
+    The "~29 usable" figure in earlier revisions described the pre-Phase-0.5 era and no
+    longer describes the corpus. The remaining constraint is the *era* boundary, not the
+    volume: the holdout must be drawn from records produced under the settled harness,
+    identified by timestamp until the era stamp lands (§3, gap 6).
   - **Gate 2 — a settled harness. Met.** Phase 0.5 is complete. What it leaves behind is
     an obligation rather than more work: the `code_execution` stamping rule in §5, and the
     era stamp in gap 6.
@@ -759,9 +1003,15 @@ the pre-August-18 corpus predates that stability and cannot be pinned against.
 
 ### Phase 1 — Recall *(~3 days)* · autonomy 2
 
-Prefixed, as of August 20, by the four cheap items in §8 — the verifier promotion, the
-benchmark registration, implicit signals, and the pin. None is more than two days, and
+**Reordered October 22, 2026.** The "prefixed by the four cheap items in §8" note is
+resolved: the verifier promotion is done (§3, gap 3), the benchmark registration is done
+(GAIA and SimpleQA now run), and the data gate is open (§3.0). The one item that is
+*not* done is the pin — and it is now the first deliverable of the whole track, ahead of
+recall itself. See §5.0.
+
 Phase 1 A/B-ing against an unmovable holdout with unlabeled episodes would be theatre.
+The episodes are no longer unlabeled, and the holdout now exists as of deliverable 1 —
+so the ordering is: build the ruler, then build the loop, then measure them against it.
 
 - Implement `memories` in `_build_messages()`; populate at the three `'memories': None`
   sites — into the `RunState` from H6, not a fourth ad-hoc parameter.
@@ -841,6 +1091,10 @@ fast gets its diff read by a human before it goes anywhere.
 | **An insensitive benchmark** — the holdout cannot register a scaffold change, so every loop reads as a null result | Gate 3 (§5): at least one agentic, unsaturated task registered before the pin. A loop that cannot lose on the holdout cannot win on it either |
 | **Signal starvation** — loops trained on unlabeled runs learn confident nonsense | Promote the verifier already recorded (§3, gap 3); implicit signals; never rely on a human remembering to click |
 | **Effort sink with no payoff** | Phase gates. Each phase must win on the holdout or the track stops. Phase 0 has standalone value regardless |
+| **The agent grades its own homework** *(added Oct 22)* — a loop edits the holdout, the judge, or the baseline, and "improvement" becomes a rewritten exam | I7: the ruler lives outside `data_path` and outside the learned store, by layout not by policy (§4.0). Holdout and baseline are read-only to the agent's own write surface |
+| **Cross-tenant leakage through recall** *(added Oct 22)* — owner isolation is inert, so episode retrieval returns global results | Owner-scoped recall, enforced in the query rather than by convention (§4.2, §5.0). `iter_records()` gains an owner filter before the first episode is injected |
+| **Stored prompt injection** *(added Oct 22)* — a playbook bullet or episode distilled from a fetched page is a durable instruction the agent later obeys | Untrusted marking on injected blocks; write-isolation between the recall path and the store it reads; the injection surface is treated as untrusted by construction, not by hope |
+| **The autonomy ladder lies** *(added Oct 22)* — a config asks for `adapt`, gets `observe`, and the run believes it is adapting | Either fail loudly when a level above what exists is requested, or rename the levels to what exists. The cap is right; the silence is the bug (`_MAX_IMPLEMENTED`) |
 
 **Explicit non-goals for v1**: no weight updates or finetuning; no unattended modification
 of the running process; no autonomous changes to the security/containment layer; no
@@ -850,36 +1104,61 @@ network-reachable self-modification surface.
 
 ## 8. Recommendation
 
-*Revised August 20, 2026; items 1–2 completed September 04, 2026. The destination is
-unchanged — Phase 2 is still the main event. What expired is the August 09 scheduling
-argument: Phase 0.5 is done, so the wait it was slotted into is over. What replaces it is a
-sharper problem. The instrument is now stable, and it is pointed at the wrong thing.*
+*Revised October 22, 2026, on the back of a full codebase review. The destination is
+unchanged — Phase 2 is still the main event. What changed is the order, and the reason
+for the order.*
 
-Phase 0 and Phase 0.5 are done. **Do the four items below — none longer than two days —
-then Phase 1, then Phase 2.** Items 1 and 2 are done (September 04): the verifier label is
-derived and backfilled (395 records: 298 clean / 29 issues / 68 unchecked), and GAIA +
-SimpleQA are registered in `benchmarks/run.py` — neither has been *run* yet (GAIA needs
-`HF_TOKEN`; SimpleQA needs a first smoke run to validate the judge), so item 4's holdout
-still waits on that.
+**The recommendation in one line: build the ruler before the loop.**
 
-The August 09 revision assumed the critical path was *data accrual* and filled the wait
-with harness work. That was right, and it worked. But the corpus it produced is thinner
-than it counts (209 records, ~29 usable — §3 gap 6), and the ruler it was going to be
-measured with cannot detect the thing being measured (§3 gap 5). So the blocker is no
-longer data. It is a **signal** and a **ruler**, and both are days away rather than weeks —
-which means Phase 2 can start *sooner* than the last revision projected, not later.
+Earlier revisions of this document treated the holdout as the last step, gated behind
+data accrual and the four cheap items below. Two of those items are done, the corpus
+grew to 1,010 records with 820 labels, and GAIA and SimpleQA are registered and SimpleQA
+has run (0.940, stderr 0.024). **The data gate is open.** What is missing is the
+instrument: there is no `eval/holdout.jsonl`, no pinned baseline beyond two rows for one
+model, and no `pinned.yaml`.
+
+That inversion matters. A self-improvement loop that ships before the ruler exists can
+only be evaluated by feel — and feel is the thing this entire track exists to eliminate.
+The literature is blunt about the base rate: the null result is the common one for
+memory scaffolds, so a recall path shipped without a holdout is most likely to ship on
+the strength of a coincidence.
+
+**So the order is §5.0's six deliverables, and it starts with the ruler:**
+
+1. **Holdout + baseline + the I1/I7 ownership invariant** — days. Freeze the holdout,
+   pin the baseline, and put the measuring instrument somewhere the agent cannot reach
+   (§4.0, I7). Owner scoping is part of this, not a follow-up: all 1,010 records are
+   `owner: null` today, and recall built on that leaks across tenants (§3.0, §5.0).
+2. **Recall (Loop A)** — ~3 days. Build the injection path, reuse `toolkit.py`'s BM25,
+   A/B against the holdout, **ship only if it wins**.
+3. **Implicit signals + text-UI rating** — ~2 days.
+4. **Playbook (Loop B)** — ~3 weeks. The main event.
+5. **Lifecycle actuator, or delete `lifecycle.py`** — days.
+6. **Skills (Loop C), then evolve (Loop D)** — 4–6 weeks.
+
+**Items 1–4 of the old list, and where each one now stands.** Items 1 and 2 are done;
+item 3 is deliverable 3; item 4 — the holdout — has been promoted from last to first.
 
 **1. Promote the verifier signal already being recorded** *(~hours)*. `verify.py` runs on
 every answer by default; `verify_issues` and `verify_revisions` are already in the `metrics`
-blob of 151 records. `derive_signals()` writes `"verifier": None` next to them. Read the
-field instead. This is the highest ratio of unlocked capability to lines changed in the
+blob. `derive_signals()` writes `"verifier": None` next to them. Read the field instead.
+This is the highest ratio of unlocked capability to lines changed in the
 document: it converts an unlabeled corpus into a weakly-labeled one retroactively, across
-data already on disk. Ratings were never going to do this — 209 tasks produced zero.
+data already on disk. Ratings were never going to do this — 1,010 tasks produced zero.
 **Done September 04, 2026** — `verifier_signal()` in `src/learn/trajectory.py` derives
 `issues` / `clean` / None (None = the check never ran, which is not "clean"), reported in
 `learn report`; `scripts/backfill_verifier_signals.py` relabeled the corpus in place:
-395 records → 298 clean, 29 issues, 68 unchecked. The 29 issue-labeled records are the
+395 records → 298 clean, 29 issues, 68 unchecked (the corpus has since grown to 1,010
+records: 820 clean / 70 issues / 120 unchecked). The issue-labeled records are the
 seed of Loop B's training set.
+
+The August 09 revision assumed the critical path was *data accrual* and filled the wait
+with harness work. That was right, and it worked. But the corpus it produced is thinner
+than it counts (the corpus has since grown to 1,010 records, 820 labeled — §3.0), and the
+ruler it was going to be
+measured with cannot detect the thing being measured (§3 gap 5). So the blocker is no
+longer data. It is a **signal** and a **ruler**, and both are days away rather than weeks —
+which means Phase 2 can start *sooner* than the last revision projected, not later.
 
 **2. Register GAIA and SimpleQA** *(~hours)*. Written, unreachable, two lines (§3, gap 5).
 Until the suite holds one task whose score can *move* when the scaffold changes, §6's
@@ -894,20 +1173,36 @@ rejects it, and the hub repo is Parquet-backed since October 2025.
 
 **3. Add implicit outcome signals** *(~2 days)*. A same-session rephrase of a task ≈
 failure; a session that ends after an answer ≈ acceptance. Both are already latent in the
-corpus and can be mined retroactively, like item 1. Together the two turn ~209 unlabeled
+corpus and can be mined retroactively, like item 1. Together the two turn ~1,010 unlabeled
 records into a usable training set for Loop B's Reflector without waiting for new usage.
 
-**4. Then freeze the holdout and pin the baseline** *(days)*. Per model, not globally (§3,
-gap 7), stamped with `code_execution` and a harness era (§5). Draw the tasks from real
-sessions but **re-run them under the current harness to score them**, which sidesteps Gate
-1's thinness without waiting weeks for it to resolve on its own.
+**4. Then freeze the holdout and pin the baseline** *(days)* → **now deliverable 1.**
+Per model, not globally (§3, gap 7), stamped with `code_execution` and a harness era
+(§5). Draw the tasks from real sessions but **re-run them under the current harness to
+score them**, which sidesteps Gate 1's thinness without waiting weeks for it to resolve
+on its own.
 **Partially done September 05, 2026** — `benchmarks/baselines/full.json` pins the two
 verifiable full-tier rows (gsm8k 0.977/1,319; bigcodebench 0.564/486 recorded) with a
 provenance block naming the harness era. humaneval/mbpp are deliberately absent: their
 only surviving logs are 0-tool harness-failure runs and their superseding runs left no
 logs — re-run them before they enter the pin. The holdout split itself is still not
-drawn; it waits on the first SimpleQA sampled/full run (judge path now validated) and a
-GAIA run (blocked on `HF_TOKEN`).
+drawn.
+**Updated October 22, 2026** — the holdout wait described above is over. The sampled-tier
+runs landed (simpleqa 0.940 / stderr 0.024, humaneval 0.970 / 0.017, mbpp 0.990 / 0.010
+— all on `glm-5.3-flash:cloud`, 14 tools live, learn off), so the measurement panel has
+tasks whose score can *move* and a validated judge path. GAIA's blocker is also
+resolved by a route the old note did not anticipate: the dataset was cached locally on
+2026-09-06, so the task now loads offline with `HF_DATASETS_OFFLINE=1` and needs no
+token. What remains is to **draw the split**, pin it, and put it where the agent cannot
+reach it (I7).
+
+**One caveat carried into the split.** Those sampled rows are *cloud-endpoint reference
+points*, not pin-gated regression-gate numbers — they are on `glm-5.3-flash:cloud`, not
+the pinned `Qwen/Qwen3.8-27B`. The holdout must be pinned per model, and the corpus
+says why (§3, gap 7): the same task on a different model is a different measurement.
+GAIA also runs **text-only by construction** today — its wrapper passes only
+`Question`/`Final answer` and ignores `file_path`, so attachment tasks are unanswerable
+as specified. That is a known scope limit to fix before GAIA enters the holdout.
 
 **Progress log (September 05, 2026):** item 2's runs started. SimpleQA smoke: **1.000**
 (5/5, model-judged, 14 tools live, 2 m 43 s) — the judge path is validated and the task
